@@ -26,6 +26,20 @@ The library supports interpolation between frames so that DSA files can have a
 smaller size by reducing the number of stored frames in it. It also supports
 blending two animations to make seamless transitions between them.
 
+**This fork adds a glTF / GLB front-end.** In addition to ``md5_to_dsma``, it
+includes ``gltf_to_dsma``, which converts skinned **glTF**/**GLB** models (for
+example exported from Blender) into the exact same DSM/DSA files. The on-device
+DSMA runtime (``library/dsma.c``) is completely unchanged — only the offline
+converter differs, so everything below about loading and drawing models applies
+identically. The shared geometry/animation backend lives in ``dsma_common.py``,
+which both converters use. See `Generating and converting glTF models`_ below.
+
+glTF avoids the MD5 workflow's friction: Blender exports glTF natively (no
+third-party MD5 addon, no "move bones to layer 5" or 0.0-weight cleanup), and
+because glTF is already Y-up, no ``--blender-fix`` rotation is needed. The same
+DSMA constraints still apply (rigid single-bone skinning, ≤29 bones), so
+multi-weight vertices are collapsed to their dominant bone at convert time.
+
 You are expected to load the files in some way (either including them as binary
 data in your game, or loading them from the filesystem) and pass them to the
 functions exposed by the library header.
@@ -165,6 +179,72 @@ The options supported are:
 - ``--draw-normal-polygons``: This is only useful for debugging. It will export
   additional polygons that represent the normals of the model in its base pose
   (they won't move when you animate the model).
+
+Generating and converting glTF models
+-------------------------------------
+
+``gltf_to_dsma`` reads a single skinned mesh (the first node that has both a
+mesh and a skin) plus all of its animations from a ``.glb`` or ``.gltf`` file,
+and writes the same ``.dsm`` (geometry) and ``.dsa`` (animation) files as
+``md5_to_dsma``. Each animation in the file becomes one DSA, named after the
+animation.
+
+The same limits apply as for MD5: at most 29 bones (one DS matrix-stack slot
+each), and rigid skinning only — each vertex is bound to its highest-weight
+bone (a warning is printed if any vertex had real multi-bone weights). glTF is
+Y-up like the DS, so no ``--blender-fix`` is required. Triangle winding is
+reversed by default to match the DS front face (use ``--no-flip-winding`` to
+keep glTF's winding).
+
+It is a zero-dependency Python script (standard library only): it parses the
+glTF JSON, binary buffers and accessors directly.
+
+Convert a model and all of its animations:
+
+.. code::
+
+    gltf_to_dsma.py --model robot.glb \
+                    --name robot \
+                    --output out_folder \
+                    --texture 128 128
+
+``gltf_to_dsma``
+----------------
+
+The options supported are:
+
+- ``--model``: ``.glb`` or ``.gltf`` file to convert. The first node with both a
+  mesh and a skin is used; all of its animations are exported as DSA files and
+  the geometry is written as a DSM file.
+
+- ``--name``: Base name used for the output files.
+
+- ``--output``: Output folder. It will be created if it doesn't exist.
+
+- ``--texture``: Texture size (``width height``). Required, same as
+  ``md5_to_dsma``: the DS has no floating-point texcoords, so the 0..1 UVs are
+  scaled by this size. For example ``--texture 32 64``.
+
+- ``--bin``: Add ``.bin`` to the end of every generated file name (handy for
+  dropping the files into a ``data`` folder of a libnds template).
+
+- ``--export-base-pose``: Export the bind pose as a one-frame DSA file.
+
+- ``--no-flip-winding``: Keep glTF's triangle winding instead of reversing it
+  (reversing is the default, to match the DS front face).
+
+- ``--draw-normal-polygons``: Debug only — export extra polygons that show the
+  base-pose normals.
+
+Validation
+----------
+
+``gltf_to_dsma`` was checked against ``md5_to_dsma`` by exporting the same
+Blender model (``models/robot``) to both MD5 and glTF and diffing the result:
+the DSA bone transforms match the MD5 reference to within one fixed-point LSB
+(1/4096) on every bone of every frame. The DSM display list differs only in how
+the variable-length vertex commands pack, which does not change the rendered
+geometry.
 
 Displaying models on the NDS
 ----------------------------
