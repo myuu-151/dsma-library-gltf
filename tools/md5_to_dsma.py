@@ -9,7 +9,8 @@ import os
 from collections import namedtuple
 from math import sqrt
 
-from display_list import DisplayList, float_to_f32
+from dsma_common import (Vector, Quaternion, Joint, joint_info_to_m4x3,
+                         save_animation, emit_triangles_to_dsm)
 
 class MD5FormatError(Exception):
     pass
@@ -22,30 +23,6 @@ def is_valid_texture_size(size):
 def assert_num_args(cmd, real, expected, tokens):
     if real != expected:
         raise MD5FormatError(f"Unexpected nargs for '{cmd}' ({real} != {expected}): {tokens}")
-
-class Quaternion():
-    def __init__(self, w, x, y, z):
-        self.w = w
-        self.x = x
-        self.y = y
-        self.z = z
-
-    def to_v3(self):
-        return Vector(self.x, self.y, self.z)
-
-    def complement(self):
-        return Quaternion(self.w, -self.x, -self.y, -self.z)
-
-    def normalize(self):
-        mag = sqrt((self.w ** 2) + (self.x ** 2) + (self.y ** 2) + (self.z ** 2))
-        return Quaternion(self.w / mag, self.x /mag, self.y / mag, self.z / mag)
-
-    def mul(self, other):
-        w = (self.w * other.w) - (self.x * other.x) - (self.y * other.y) - (self.z * other.z)
-        x = (self.x * other.w) + (self.w * other.x) + (self.y * other.z) - (self.z * other.y)
-        y = (self.y * other.w) + (self.w * other.y) + (self.z * other.x) - (self.x * other.z)
-        z = (self.z * other.w) + (self.w * other.z) + (self.x * other.y) - (self.y * other.x)
-        return Quaternion(w, x, y, z)
 
 def quaternion_fill_incomplete_w(v):
     """
@@ -60,61 +37,28 @@ def quaternion_fill_incomplete_w(v):
         w = -sqrt(t)
     return Quaternion(w, v[0], v[1], v[2])
 
-class Vector():
-    def __init__(self, x, y, z):
-        self.x = x
-        self.y = y
-        self.z = z
-
-    def to_q(self):
-        return Quaternion(0, self.x, self.y, self.z)
-
-    def length(self):
-        return sqrt((self.x ** 2) + (self.y ** 2) + (self.z ** 2))
-
-    def normalize(self):
-        mag = self.length()
-        return Vector(self.x / mag, self.y / mag, self.z / mag)
-
-    def add(self, other):
-        return Vector(self.x + other.x, self.y + other.y, self.z + other.z)
-
-    def sub(self, other):
-        return Vector(self.x - other.x, self.y - other.y, self.z - other.z)
-
-    def cross(self, other):
-        x = (self.y * other.z) - (other.y * self.z)
-        y = (self.z * other.x) - (other.z * self.x)
-        z = (self.x * other.y) - (other.x * self.y)
-        return Vector(x, y, z)
-
-    def mul_m4x3(self, m):
-        x = (self.x * m[0][0]) + (self.y * m[0][1]) + (self.z * m[0][2]) + (m[0][3] * 1)
-        y = (self.x * m[1][0]) + (self.y * m[1][1]) + (self.z * m[1][2]) + (m[1][3] * 1)
-        z = (self.x * m[2][0]) + (self.y * m[2][1]) + (self.z * m[2][2]) + (m[2][3] * 1)
-        return Vector(x, y, z)
-
-def joint_info_to_m4x3(q, trans):
+def apply_blender_fix(frames, blender_fix):
     """
-    This generates a 4x3 matrix that represents a rotation and a translation.
-    q is a Quaternion with a orientation, trans is a Vector with a translation.
+    Blender uses Z as "up", the DS uses Y as "up". The bones in the DSA store
+    absolute transforms, so every bone must be rotated by -90 degrees on the X
+    axis to match the DS coordinate system. The DSM stores vertices in joint
+    space (invariant under this global rotation) so it is left untouched.
     """
-    wx = 2 * q.w * q.x
-    wy = 2 * q.w * q.y
-    wz = 2 * q.w * q.z
-    x2 = 2 * q.x * q.x
-    xy = 2 * q.x * q.y
-    xz = 2 * q.x * q.z
-    y2 = 2 * q.y * q.y
-    yz = 2 * q.y * q.z
-    z2 = 2 * q.z * q.z
+    if not blender_fix:
+        return frames
 
-    return [[1 - y2 - z2,     xy - wz,     xz + wy, trans.x],
-            [    xy + wz, 1 - x2 - z2,     yz - wx, trans.y],
-            [    xz - wy,     yz + wx, 1 - x2 - y2, trans.z]]
+    q_rot = Quaternion(0.7071068, -0.7071068, 0, 0)
+    fixed = []
+    for joints in frames:
+        new_joints = []
+        for joint in joints:
+            orient = q_rot.mul(joint.orient)
+            pos = Vector(joint.pos.x, joint.pos.z, -joint.pos.y)
+            new_joints.append(Joint(joint.name, joint.parent, pos, orient))
+        fixed.append(new_joints)
+    return fixed
 
 def parse_md5mesh(input_file):
-    Joint = namedtuple("Joint", "name parent pos orient")
     Vert = namedtuple("Vert", "st startWeight countWeight")
     Weight = namedtuple("Weight", "joint bias pos")
     Mesh = namedtuple("Mesh", "numverts verts numtris tris numweights weights")
@@ -338,8 +282,6 @@ def parse_md5mesh(input_file):
     return (joints, meshes)
 
 def parse_md5anim(input_file):
-    Joint = namedtuple("Joint", "name parent pos orient")
-
     joints = []
     frames = []
 
@@ -550,46 +492,6 @@ def parse_md5anim(input_file):
 
     return frames
 
-def save_animation(frames, output_file, blender_fix):
-
-    version = 1
-    num_frames = len(frames)
-    num_bones = len(frames[0])
-
-    u32_array = [version, num_frames, num_bones]
-
-    for joints in frames:
-        if num_bones != len(joints):
-            raise MD5FormatError("Different number of bones across frames")
-
-        for joint in joints:
-            this_pos = joint.pos
-            this_orient = joint.orient
-
-            if blender_fix:
-                # It is needed to rotate all bones because all bones have
-                # absolute transformations. Rotate orientation and position by
-                # -90 degrees on the X axis.
-                q_rot = Quaternion(0.7071068, -0.7071068, 0, 0)
-                this_orient = q_rot.mul(this_orient)
-                this_pos = Vector(this_pos.x, this_pos.z, -this_pos.y)
-
-            pos = [float_to_f32(this_pos.x), float_to_f32(this_pos.y),
-                   float_to_f32(this_pos.z)]
-            orient = [float_to_f32(this_orient.w), float_to_f32(this_orient.x),
-                      float_to_f32(this_orient.y), float_to_f32(this_orient.z)]
-
-            u32_array.extend(pos)
-            u32_array.extend(orient)
-
-    with open(output_file, "wb") as f:
-        for u32 in u32_array:
-            b = [u32 & 0xFF, \
-                (u32 >> 8) & 0xFF, \
-                (u32 >> 16) & 0xFF, \
-                (u32 >> 24) & 0xFF]
-            f.write(bytearray(b))
-
 def convert_md5mesh(model_file, name, output_folder, texture_size,
                     draw_normal_polygons, extension_mesh, extension_anim,
                     blender_fix, export_base_pose):
@@ -609,149 +511,30 @@ def convert_md5mesh(model_file, name, output_folder, texture_size,
     if export_base_pose:
         print("Converting base pose...")
 
-        save_animation([joints],
-                       os.path.join(output_folder, f"{name}{extension_anim}"),
-                       blender_fix)
+        save_animation(apply_blender_fix([joints], blender_fix),
+                       os.path.join(output_folder, f"{name}{extension_anim}"))
 
     print("Converting meshes...")
 
-    # Display list shared between all meshes
-    dl = DisplayList()
-    dl.switch_vtxs("triangles")
-
-    base_matrix = 30 - len(joints) + 1
-    last_joint_index = None
-
+    # Flatten all meshes into a single neutral triangle list. Each vertex becomes
+    # (joint_index, joint-space position, st) — the form the shared emit expects.
+    triangles = []
     for mesh in meshes:
         print(f"  Vertices: {mesh.numverts}")
         print(f"  Tris:     {mesh.numtris}")
         print(f"  Weights:  {mesh.numweights}")
-
-        print("  Generating per-triangle normals...")
-
-        tri_normal = []
         for tri in mesh.tris:
-            verts = [mesh.verts[i] for i in tri]
-            weights = [mesh.weights[v.startWeight] for v in verts]
+            triangle = []
+            for i in tri:
+                vert = mesh.verts[i]
+                weight = mesh.weights[vert.startWeight]
+                triangle.append((weight.joint, weight.pos, vert.st))
+            triangles.append(triangle)
 
-            vtx = []
-            for vert, weight in zip(verts, weights):
-                joint = joints[weight.joint]
-                m = joint_info_to_m4x3(joint.orient, joint.pos)
-                final = weight.pos.mul_m4x3(m)
-                vtx.append(final)
-
-            a = vtx[0].sub(vtx[1])
-            b = vtx[1].sub(vtx[2])
-
-            n = a.cross(b)
-
-            if n.length() > 0:
-                n = n.normalize()
-                tri_normal.append(n)
-            else:
-                tri_normal.append(Vector(0, 0, 0))
-
-        print("  Generating display list...")
-
-        for tri, norm in zip(mesh.tris, tri_normal):
-            verts = [mesh.verts[i] for i in tri]
-            weights = [mesh.weights[v.startWeight] for v in verts]
-
-            finals = []
-
-            for vert, weight in zip(verts, weights):
-
-                # Texture
-                # -------
-
-                st = vert.st
-                # In the MD5 format (0, 0) is the top-left corner, same as what
-                # the GPU of the DS expects.
-                u = st[0] * texture_size[0]
-                v = st[1] * texture_size[1]
-                dl.texcoord(u, v)
-
-                # Vertex and normal
-                # -----------------
-
-                # Load joint matrix. When drawing normal polygons it has to be
-                # loaded every time, because drawing the normal restores the
-                # original matrix.
-
-                joint_index = weight.joint
-                if draw_normal_polygons or joint_index != last_joint_index:
-                    dl.mtx_restore(base_matrix + joint_index)
-                    last_joint_index = joint_index
-
-                # Calculate normal in joint space
-
-                joint = joints[joint_index]
-
-                q = joint.orient
-                qt = q.complement()
-                n = norm.to_q()
-
-                # Transform by the inverted quaternion
-                n = qt.mul(n).mul(q).to_v3()
-                if n.length() > 0:
-                    n = n.normalize()
-                dl.normal(n.x, n.y, n.z)
-
-                # The vertex is already in joint space
-
-                dl.vtx(weight.pos.x, weight.pos.y, weight.pos.z)
-
-                if draw_normal_polygons:
-                    # Calculate actual location of the vertex so that the
-                    # vertices of the triangle can be averaged as origin of the
-                    # normal polygon.
-                    q = joint.orient
-                    qt = q.complement()
-                    v = weight.pos.to_q()
-
-                    delta = q.mul(v).mul(qt).to_v3()
-
-                    final = joint.pos.add(delta)
-                    finals.append(final)
-
-            if draw_normal_polygons:
-
-                # Don't use any of the joint transformation matrices
-                dl.mtx_restore(1)
-
-                vert_avg = Vector(
-                    (finals[0].x + finals[1].x + finals[2].x) / 3,
-                    (finals[0].y + finals[1].y + finals[2].y) / 3,
-                    (finals[0].z + finals[1].z + finals[2].z) / 3
-                )
-
-                vert_avg_end = vert_avg.add(norm)
-
-                dl.texcoord(0, 0)
-
-                dl.color(1, 0, 0)
-                dl.vtx(vert_avg.x + 0.1, vert_avg.y, vert_avg.z)
-                dl.vtx(vert_avg.x, vert_avg.y, vert_avg.z)
-                dl.color(0, 1, 0)
-                dl.vtx(vert_avg_end.x, vert_avg_end.y, vert_avg_end.z)
-
-                dl.color(1, 0, 0)
-                dl.vtx(vert_avg.x, vert_avg.y, vert_avg.z)
-                dl.vtx(vert_avg.x, vert_avg.y + 0.1, vert_avg.z)
-                dl.color(0, 1, 0)
-                dl.vtx(vert_avg_end.x, vert_avg_end.y, vert_avg_end.z)
-
-                dl.color(1, 0, 0)
-                dl.vtx(vert_avg.x, vert_avg.y, vert_avg.z)
-                dl.vtx(vert_avg.x, vert_avg.y, vert_avg.z + 0.1)
-                dl.color(0, 1, 0)
-                dl.vtx(vert_avg_end.x, vert_avg_end.y, vert_avg_end.z)
-
-    dl.end_vtxs()
-    dl.finalize()
-
-    dl.save_to_file(os.path.join(output_folder, f"{name}{extension_mesh}"))
+    print("  Generating display list...")
+    emit_triangles_to_dsm(joints, triangles, texture_size,
+                          os.path.join(output_folder, f"{name}{extension_mesh}"),
+                          draw_normal_polygons)
 
 
 def convert_md5anim(name, output_folder, anim_file, skip_frames, extension_anim,
@@ -766,8 +549,8 @@ def convert_md5anim(name, output_folder, anim_file, skip_frames, extension_anim,
     anim_name = file_basename.replace(".", "_").lower()
 
     frames = frames[::skip_frames+1]
-    save_animation(frames, os.path.join(output_folder,
-                   f"{name}_{anim_name}{extension_anim}"), blender_fix)
+    save_animation(apply_blender_fix(frames, blender_fix),
+                   os.path.join(output_folder, f"{name}_{anim_name}{extension_anim}"))
 
 
 if __name__ == "__main__":
@@ -810,7 +593,7 @@ if __name__ == "__main__":
                         help="export base pose of a md5mesh as a DSA file")
     parser.add_argument("--skip-frames", required=False,
                         default=0, type=int,
-                        help="number of frames to skip in an animation (0 = export all, 1 = export half, 2 = export 33%, etc)")
+                        help="number of frames to skip in an animation (0 = export all, 1 = export half, 2 = export 33%%, etc)")
     parser.add_argument("--draw-normal-polygons", required=False,
                         action='store_true',
                         help="draw polygons with the shape of normals for debugging")
@@ -848,12 +631,12 @@ if __name__ == "__main__":
             convert_md5anim(args.name, args.output, anim_file, args.skip_frames,
                             extension_anim, args.blender_fix)
 
-    except BaseException as e:
-        print("ERROR: " + str(e))
-        traceback.print_exc()
-        sys.exit(1)
     except MD5FormatError as e:
         print("ERROR: Invalid MD5 file: " + str(e))
+        traceback.print_exc()
+        sys.exit(1)
+    except BaseException as e:
+        print("ERROR: " + str(e))
         traceback.print_exc()
         sys.exit(1)
 
